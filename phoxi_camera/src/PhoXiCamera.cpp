@@ -97,13 +97,15 @@ CallbackReturn PhoXiCamera::on_configure(const rclcpp_lifecycle::State& /*previo
     }
     get_parameter("frame_id", mFrameId);
     get_parameter("publish_combined", mPublishCombined);
-    if (mDeviceId.empty()) {
-        RCLCPP_ERROR(get_logger(), "Configuration failed: 'device_id' parameter is empty.");
-        return CallbackReturn::FAILURE;
-    }
+    // Empty device_id connects to the first available device.
 
     try {
         mPhoXiInterface->connectCamera(mDeviceId, std::bind(&PhoXiCamera::onFrameCallback, this, std::placeholders::_1));
+        if (mDeviceId.empty()) {
+            const std::string resolved = mPhoXiInterface->getDeviceInfo();
+            std::lock_guard<std::mutex> lock(mDeviceIdMutex);
+            mDeviceId = resolved;
+        }
     } catch (const PhoXiInterfaceException& e) {
         RCLCPP_ERROR(get_logger(), "Configuration failed: %s", e.what());
         return CallbackReturn::FAILURE;
@@ -135,19 +137,21 @@ CallbackReturn PhoXiCamera::on_configure(const rclcpp_lifecycle::State& /*previo
         return CallbackReturn::FAILURE;
     }
 
-    mFrameErrorPub = create_publisher<phoxi_camera_msgs::msg::FrameError>("~/frame_error", rclcpp::SystemDefaultsQoS());
-    mFrameInfoPub = create_publisher<phoxi_camera_msgs::msg::FrameInfo>("~/frame_info", rclcpp::SystemDefaultsQoS());
-    mPrimaryCameraInfoPub = create_publisher<sensor_msgs::msg::CameraInfo>("~/frame_info/current_camera", rclcpp::SystemDefaultsQoS());
-    mColorCameraInfoPub = create_publisher<sensor_msgs::msg::CameraInfo>("~/frame_info/current_color_camera", rclcpp::SystemDefaultsQoS());
-    mPointCloudPub = create_publisher<sensor_msgs::msg::PointCloud2>("~/point_cloud", rclcpp::SystemDefaultsQoS());
-    mPointsPub = create_publisher<sensor_msgs::msg::PointCloud2>("~/points", rclcpp::SystemDefaultsQoS());
-    mNormalMapPub = create_publisher<sensor_msgs::msg::Image>("~/normals", rclcpp::SystemDefaultsQoS());
-    mDepthMapPub = create_publisher<sensor_msgs::msg::Image>("~/depth", rclcpp::SystemDefaultsQoS());
-    mConfidenceMapPub = create_publisher<sensor_msgs::msg::Image>("~/confidence", rclcpp::SystemDefaultsQoS());
-    mEventMapPub = create_publisher<sensor_msgs::msg::Image>("~/event", rclcpp::SystemDefaultsQoS());
-    mTexturePub = create_publisher<sensor_msgs::msg::Image>("~/intensity", rclcpp::SystemDefaultsQoS());
-    mTextureRgbPub = create_publisher<sensor_msgs::msg::Image>("~/texture", rclcpp::SystemDefaultsQoS());
-    mColorCameraImagePub = create_publisher<sensor_msgs::msg::Image>("~/color_camera_image", rclcpp::SystemDefaultsQoS());
+    // Intra-process comms requires volatile durability on every publisher.
+    const auto pubQos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable().durability_volatile();
+    mFrameErrorPub = create_publisher<phoxi_camera_msgs::msg::FrameError>("~/frame_error", pubQos);
+    mFrameInfoPub = create_publisher<phoxi_camera_msgs::msg::FrameInfo>("~/frame_info", pubQos);
+    mPrimaryCameraInfoPub = create_publisher<sensor_msgs::msg::CameraInfo>("~/frame_info/current_camera", pubQos);
+    mColorCameraInfoPub = create_publisher<sensor_msgs::msg::CameraInfo>("~/frame_info/current_color_camera", pubQos);
+    mPointCloudPub = create_publisher<sensor_msgs::msg::PointCloud2>("~/point_cloud", pubQos);
+    mPointsPub = create_publisher<sensor_msgs::msg::PointCloud2>("~/points", pubQos);
+    mNormalMapPub = create_publisher<sensor_msgs::msg::Image>("~/normals", pubQos);
+    mDepthMapPub = create_publisher<sensor_msgs::msg::Image>("~/depth", pubQos);
+    mConfidenceMapPub = create_publisher<sensor_msgs::msg::Image>("~/confidence", pubQos);
+    mEventMapPub = create_publisher<sensor_msgs::msg::Image>("~/event", pubQos);
+    mTexturePub = create_publisher<sensor_msgs::msg::Image>("~/intensity", pubQos);
+    mTextureRgbPub = create_publisher<sensor_msgs::msg::Image>("~/texture", pubQos);
+    mColorCameraImagePub = create_publisher<sensor_msgs::msg::Image>("~/color_camera_image", pubQos);
 
     mConnectService = create_service<phoxi_camera_msgs::srv::Connect>("~/connect", std::bind(&PhoXiCamera::connectCallback, this, std::placeholders::_1, std::placeholders::_2));
     mDisconnectService = create_service<std_srvs::srv::Trigger>("~/disconnect", std::bind(&PhoXiCamera::disconnectCallback, this, std::placeholders::_1, std::placeholders::_2));
@@ -944,7 +948,8 @@ void PhoXiCamera::onFrameCallback(const PhoXiFrame& frame) {
         };
 
         auto shouldPublish = [](const auto& pub) {
-            return pub->is_activated() && pub->get_subscription_count() > 0;
+            // pub may be null if a frame arrives before publishers are created in on_configure.
+            return pub && pub->is_activated() && pub->get_subscription_count() > 0;
         };
 
         std::optional<ParsedFrameInfo> parsedFrameInfo;
@@ -1139,15 +1144,13 @@ void PhoXiCamera::connectCallback(
         return;
     }
 
-    const std::string& snToUse = request->sn.empty() ? mDeviceId : request->sn;
+    std::string snToUse = request->sn.empty() ? mDeviceId : request->sn;
+    // Empty connects to the first available device.
     if (snToUse.empty()) {
-        RCLCPP_ERROR(get_logger(), "Connection failed: No device ID provided.");
-        response->success = false;
-        response->message = "No device ID provided.";
-        return;
+        RCLCPP_INFO(get_logger(), "No device id provided; connecting to the first available device.");
+    } else {
+        RCLCPP_INFO(get_logger(), "Service call to connect to device: %s", snToUse.c_str());
     }
-
-    RCLCPP_INFO(get_logger(), "Service call to connect to device: %s", snToUse.c_str());
 
     bool isActive = (stateId == lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
     if (isActive) {
@@ -1159,6 +1162,12 @@ void PhoXiCamera::connectCallback(
     }
     try {
         mPhoXiInterface->connectCamera(snToUse, std::bind(&PhoXiCamera::onFrameCallback, this, std::placeholders::_1));
+        if (snToUse.empty()) {
+            const std::string resolved = mPhoXiInterface->getDeviceInfo();
+            std::lock_guard<std::mutex> lock(mDeviceIdMutex);
+            mDeviceId = resolved;
+            snToUse = resolved;
+        }
         if (isActive) {
             mPhoXiInterface->startAcquisition();
         }

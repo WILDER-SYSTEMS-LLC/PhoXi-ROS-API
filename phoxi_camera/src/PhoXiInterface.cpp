@@ -427,8 +427,14 @@ std::vector<std::string> PhoXiInterface::cameraList() {
 }
 
 void PhoXiInterface::connectCamera(const std::string& deviceId, GetFrameCallback&& getFrameCallback) {
-    if (deviceId.empty()) {
-        throw PhoXiInterfaceException("Device ID can not be empty.");
+    std::string resolvedId = deviceId;
+    if (resolvedId.empty()) {
+        // No device id given: connect to the first available device.
+        const auto devices = cameraList();
+        if (devices.empty()) {
+            throw PhoXiInterfaceException("No PhoXi devices found.");
+        }
+        resolvedId = devices.front();
     }
 
     if (!getFrameCallback) {
@@ -436,7 +442,7 @@ void PhoXiInterface::connectCamera(const std::string& deviceId, GetFrameCallback
     }
 
     if (mPhoXiDevice && isConnected()) {
-        if (mPhoXiDevice->HardwareIdentification.GetStoredValue() != deviceId) {
+        if (mPhoXiDevice->HardwareIdentification.GetStoredValue() != resolvedId) {
             throw UnableToConnect("Device still connected, disconnect first.");
         }
         std::lock_guard<std::mutex> lock(mFrameCallbackMutex);
@@ -444,12 +450,12 @@ void PhoXiInterface::connectCamera(const std::string& deviceId, GetFrameCallback
         return;
     }
 
-    mPhoXiDevice = mPhoXiFactory.CreateAndConnect(deviceId, CONNECTION_TIMEOUT_MS);
+    mPhoXiDevice = mPhoXiFactory.CreateAndConnect(resolvedId, CONNECTION_TIMEOUT_MS);
     if (!mPhoXiDevice) {
         throw UnableToConnect("Device was not able to connect. Disconnected.");
     }
 
-    if (phoxi_aframe_enable(deviceId.c_str(), &PhoXiInterface::frameAcceptor, this) != PHOXI_OK) {
+    if (phoxi_aframe_enable(resolvedId.c_str(), &PhoXiInterface::frameAcceptor, this) != PHOXI_OK) {
         const char* errMsg = nullptr;
         phoxi_error_last(&errMsg);
         disconnectCamera();
